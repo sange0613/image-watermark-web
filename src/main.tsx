@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { originalCrop } from './original-export';
 import { createRoot } from 'react-dom/client';
 import JSZip from 'jszip';
 import {
@@ -186,7 +187,8 @@ function App() {
   const live = selectedPhoto?.live ?? defaultLive;
   const liveCount = photos.filter(photo => photo.live.enabled).length;
   const sizePresets = useMemo(() => getPresetSizes(aspectRatio), [aspectRatio]);
-  const exportSize = sizeIndex < sizePresets.length ? sizePresets[sizeIndex] : customSize;
+  const originalQuality = sizeIndex === -1;
+  const exportSize = originalQuality ? (selectedPhoto ? originalCrop(selectedPhoto) : customSize) : sizeIndex >= 0 && sizeIndex < sizePresets.length ? sizePresets[sizeIndex] : customSize;
   const canUseDirectoryPicker = Boolean(window.desktop) || typeof window.showDirectoryPicker === 'function';
   const outputFolderName = desktopFolder ?? (directoryHandle ? directoryHandle.name || '所选文件夹' : undefined);
   const prepareLivePreview = useCallback(() => prepareLiveScene(selectedPhoto!, exportSize, watermark, watermarkImage), [selectedPhoto, exportSize.width, exportSize.height, watermark, watermarkImage]);
@@ -559,7 +561,7 @@ function App() {
       setStatus('请先添加图片。');
       return;
     }
-    if (![exportSize.width, exportSize.height].every((value) => Number.isInteger(value) && value > 0 && value <= 8192) || exportSize.width * exportSize.height > 40000000) { setStatus('导出尺寸须为 1 至 8192 的整数，且总像素不超过 4000 万'); return; }
+    if (!originalQuality && (![exportSize.width, exportSize.height].every((value) => Number.isInteger(value) && value > 0 && value <= 8192) || exportSize.width * exportSize.height > 40000000)) { setStatus('导出尺寸须为 1 至 8192 的整数，且总像素不超过 4000 万'); return; }
     if (watermark.enabled && !watermarkImage) { setStatus('请先选择水印图片'); return; }
     exportLock.current = true;
     cancelled.current = false;
@@ -581,9 +583,14 @@ function App() {
       const photo = queue[index];
       updatePhoto(photo.id, (item) => ({ ...item, status: '正在导出' }));
       try {
-        const blob = await renderExport(photo, exportSize, format, watermark, watermarkImage);
+        const native = originalQuality ? originalCrop(photo) : null;
+        const source = native ? { ...photo, crop: native } : photo;
+        const size = native ?? exportSize;
+        if (size.width * size.height > 40000000 || Math.max(size.width, size.height) > 32767) throw new Error('图片超过安全导出上限，请裁剪到 4000 万像素以内或选择其他尺寸');
+        const outputFormat = originalQuality ? 'png' : format;
+        const blob = await renderExport(source, size, outputFormat, watermark, watermarkImage);
         if (cancelled.current) { updatePhoto(photo.id, (item) => ({ ...item, status: '已取消' })); break; }
-        const baseName = createOutputName(photo.name, format, aspectRatio);
+        const baseName = createOutputName(photo.name, outputFormat, aspectRatio);
         let name = baseName;
         let suffix = 1;
         while (true) {
@@ -592,7 +599,7 @@ function App() {
             try { await directoryHandle.getFileHandle(name); exists = true; } catch (error) { if (!(error instanceof DOMException && error.name === 'NotFoundError')) throw error; }
           }
           if (!exists) break;
-          name = baseName.replace(/\.[^.]+$/, `-${suffix++}.${format}`);
+          name = baseName.replace(/\.[^.]+$/, `-${suffix++}.${outputFormat}`);
         }
         usedNames.add(name.toLowerCase());
         if (window.desktop) {
@@ -633,7 +640,7 @@ function App() {
     if (lutLoading) { setStatus('请等待 LUT 导入完成'); return; }
     const queue = photos.filter(photo => photo.live.enabled && (!retryOnly || failures.some(f => f.id === photo.id)));
     if (!queue.length) { setStatus('请先为图片启用实况'); return; }
-    if (![exportSize.width, exportSize.height].every(n => Number.isInteger(n) && n >= 2 && n <= 8192)) { setStatus('实况导出尺寸须为 2 至 8192 的整数'); return; }
+    if (!originalQuality && ![exportSize.width, exportSize.height].every(n => Number.isInteger(n) && n >= 2 && n <= 8192)) { setStatus('实况导出尺寸须为 2 至 8192 的整数'); return; }
     if (watermark.enabled && !watermarkImage) { setStatus('请先选择水印图片'); return; }
     exportLock.current = true;
     cancelled.current = false;
@@ -649,7 +656,7 @@ function App() {
         setStatus(`正在生成实况 ${index + 1} / ${queue.length}：${photo.name}`);
         updatePhoto(photo.id, item => ({ ...item, status: '正在生成实况' }));
         try {
-          const { source, overlay } = await prepareLiveScene(photo, exportSize, watermark, watermarkImage);
+          const { source, overlay } = await prepareLiveScene(photo, originalQuality ? originalCrop(photo) : exportSize, watermark, watermarkImage);
           const pair = await encodeLivePhoto(source, photo.live.effect, overlay, () => cancelled.current, value => setExportProgress((index + value) / queue.length * 90));
           if (cancelled.current) throw new DOMException('已取消', 'AbortError');
           const base = liveStem(photo.name, aspectRatio.width, aspectRatio.height);
@@ -941,6 +948,7 @@ function App() {
           <ControlSection title="导出设置">
             <label>图片尺寸</label>
             <select aria-label="图片尺寸" value={sizeIndex} onChange={(event) => setSizeIndex(Number(event.target.value))}>
+              <option value={-1}>原图原画质（原像素 · PNG 无损）</option>
               {sizePresets.map((size, index) => <option key={`${size.width}-${size.height}`} value={index}>{size.width} × {size.height}</option>)}
               <option value={sizePresets.length}>自定义</option>
             </select>
@@ -952,7 +960,7 @@ function App() {
               </div>
             )}
             <label>输出格式</label>
-            <select aria-label="输出格式" value={format} onChange={(event) => setFormat(event.target.value as 'jpg' | 'png' | 'webp')}>
+            <select aria-label="输出格式" disabled={originalQuality} value={originalQuality ? 'png' : format} onChange={(event) => setFormat(event.target.value as 'jpg' | 'png' | 'webp')}>
               <option value="jpg">JPG</option>
               <option value="png">PNG</option>
               <option value="webp">WebP</option>
